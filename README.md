@@ -42,3 +42,13 @@ go test -race ./05-goroutines-channels/...
 ```
 
 做完这五个之后可以叫我给下一批（error wrapping/自定义 error、简单的 HTTP server）。
+
+## 其他
+
+- [playground/](playground/) — 独立的一次性小实验代码放这里（`package main`），
+  跑法：`go run playground/文件名.go`。不要把 `package main` 文件混进上面的练习目录，
+  会导致整个目录编译失败（同目录下所有 `.go` 文件必须是同一个包名）。
+- [LEARNING-LOG.md](LEARNING-LOG.md) — 问答复盘笔记，把每次深挖"为什么"的内容
+  按主题沉淀下来，方便后续快速复习，不用翻整个对话记录。
+- [TECH_LEARNING_ROADMAP.md](TECH_LEARNING_ROADMAP.md) — 这个仓库在整体求职技术学习
+  规划里的定位（Go 是加分项，优先级低于 Docker/AWS SAA，不应抢占主线学习时间）。

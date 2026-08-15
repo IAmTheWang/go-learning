@@ -3,7 +3,11 @@ package main
 import "fmt"
 
 func main() {
-	ch := make(chan int) // 没有任何人往里面发东西
+	ch := make(chan int) // channel 变量，这次真的声明了
+
+	go func() {
+		ch <- 42 // 加了一个真的会发送的 goroutine
+	}()
 
 	select {
 	case v := <-ch:
