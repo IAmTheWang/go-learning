@@ -10,7 +10,13 @@ package concurrency
 // the result (see the notes.md example using `select` + `time.After`
 // for how the test protects itself from a hang).
 func SquareAsync(n int) <-chan int {
-	return nil
+
+	ch := make(chan int, 1)
+	go func() {
+		ch <- n * n
+	}()
+
+	return ch
 }
 
 // SumConcurrent splits nums into `workers` roughly-equal chunks, sums each

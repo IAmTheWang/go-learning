@@ -25,6 +25,8 @@ Directories, in the order they should be done:
 | `03-structs-interfaces` | struct, method receivers, interfaces (structural typing) |
 | `04-slices-maps` | slice, map |
 | `05-goroutines-channels` | goroutine, channel, select, WaitGroup, Mutex |
+| `06-http-basics` | net/http handlers, query params, encoding/json responses |
+| `07-errors-interfaces` | custom error types, error wrapping (`%w`/`errors.As`), `fmt.Stringer` |
 
 Each subdirectory has its own `CLAUDE.md` with exercise-specific notes and gotchas.
 
