@@ -1730,6 +1730,285 @@ PrintArea(Dog{}) // 编译器在这一行才检查：Dog 有没有 Area() float6
 
 ---
 
+## 29. 纠正第 28 节一个不准确的地方:`implements` 不是"赋予身份",而是"声明承诺 + 提前检查"
+
+第 28 节说"TS 需要手动 implements 才能满足 interface"——这句话不准确,
+需要纠正。
+
+### 不写 `implements`,TS 照样满足 interface
+
+```ts
+interface Shape { area(): number }
+
+class Rectangle {
+  area(): number { return 100 }
+}
+
+const shape: Shape = new Rectangle() // 合法！TS 也是结构化类型，不需要 implements
+```
+
+这里没有任何 `implements`,但 `const shape: Shape = new Rectangle()` 依然
+成立,因为 TS 检查的是"`Rectangle` 有没有 `area(): number`",不是有没有
+写 `implements`。所以**满足 interface 这件事,TS 和 Go 是一样的**:都看
+方法签名匹不匹配,跟你写不写声明无关。
+
+### 那 `implements` 到底在干嘛?——声明一个"承诺",然后让编译器现在就检查
+
+`implements` 真正的作用不是"让 Rectangle 变成 Shape",而是:
+
+> "编译器,我保证这个 class 是按这个 interface 设计的,你现在就帮我检查。"
+
+对比两种写法在"漏了 `area()`"时的表现:
+
+```ts
+// 不写 implements：现在不报错，因为你没许下这个承诺
+class Rectangle {
+  width = 3; height = 4
+  // 没有 area()，TS 这里完全不管
+}
+// 只有真正需要当 Shape 用的时候，才会在【那一行】报错：
+const shape: Shape = new Rectangle() // ❌ 报错在这里，不是 class 声明处
+
+// 写了 implements：立刻在 class 声明处报错
+class Rectangle implements Shape {
+  width = 3; height = 4
+  // ❌ 报错就在这一行：Class 'Rectangle' incorrectly implements interface 'Shape'
+}
+```
+
+区别只是**检查发生的时间点被提前了**,不是"有没有资格满足 interface"。
+
+### 一个很形象的比喻:考试报名
+
+- **Go**:老师(编译器)从不主动问你报没报名。你什么时候被要求"当 Shape
+  用"(比如传给一个参数类型是 `Shape` 的函数),老师才当场查一下你会不会
+  `Area()`。会就放行,不会就当场挂。Go **连"报名"这个动作都不存在**。
+- **TS 不写 `implements`**:和 Go 几乎一样——没人问你报没报名,等你被
+  当成 `Shape` 用的那一刻,编译器才检查。
+- **TS 写了 `implements Shape`**:你主动去老师那报了名("我要考 Shape
+  这门"),于是老师**当场**就核对你的方法表,不用等到真正"上考场"(被赋值
+  给 `Shape` 类型变量)的那一刻——提前暴露问题,而不是延后到使用处才炸。
+
+### 最关键的一句话,替换第 28 节里不准确的表述
+
+~~"Go 满足条件就有 interface,但 TS 需要手动 implements"~~ ❌
+
+改成:**Go 和 TS 满足 interface 的判定方式一样(结构化类型、只看方法签
+名),区别在于 TS 多提供了一个可选的 `implements` 声明,让你能把"检查
+时机"从"使用处"提前到"class 声明处";Go 没有这个可选项,永远只能在
+使用处才被检查——这才是"完全隐式"真正落地的地方。**
+
+---
+
+## 30. 为什么 error 类型喜欢用指针接收者,`errors.As(err, &target)` 里的 `&target` 又是怎么回事(07 单元)
+
+这里其实是两个独立问题叠在一起了,拆开看。
+
+### 问题一:`func (e *NotFoundError) Error() string` 为什么用指针接收者
+
+先说结论:**不是必须**。下面这样写完全合法,一样能实现 `error`:
+
+```go
+type NotFoundError struct{ ID int }
+func (e NotFoundError) Error() string { return "not found" } // 值接收者，也 OK
+```
+
+用指针接收者(`*NotFoundError`)是**社区惯例**,原因是 error 通常更像
+"一个具体的错误对象",而不是"可以随便复制的普通数据"。
+
+真正需要注意的是:**接收者类型决定了 interface 的满足范围**。
+
+```go
+func (e NotFoundError) Error() string { ... }
+// NotFoundError  满足 error ✅
+// *NotFoundError 满足 error ✅ （值接收者，两种形式都自动满足）
+
+func (e *NotFoundError) Error() string { ... }
+// NotFoundError  满足 error ❌
+// *NotFoundError 满足 error ✅ （指针接收者，只有指针形式满足）
+```
+
+这跟第 27/28 节讲的"interface 只看方法签名匹不匹配"是同一套逻辑,只是
+这里多了一层:**方法到底挂在 `T` 上还是 `*T` 上,决定了谁有资格入场**。
+
+### 问题二:`errors.As(err, &target)` 里为什么是"指针的指针"
+
+```go
+var target *NotFoundError
+errors.As(err, &target)
+```
+
+先分清三个层级,这是最容易绕晕的地方:
+
+| 写法 | 含义 |
+|---|---|
+| `NotFoundError` | 值本身 |
+| `*NotFoundError` | 指向 `NotFoundError` 的指针 |
+| `&target`(`target` 是 `*NotFoundError`) | 指向"`target` 这个变量"的指针,也就是 `**NotFoundError` |
+
+`errors.As` 的第二个参数存在的意义是:**"如果在 `err` 的包装链条里找到
+匹配的类型,请把结果写回给我"**。既然要"写回"到你的变量,`errors.As`
+就必须拿到**这个变量本身的地址**,这跟第 3 节"储物柜"比喻、第 21 节
+"复印件 vs 钥匙"是同一个模式:**要修改调用者的变量,必须传地址进去**,
+跟这个变量本身存的是不是指针无关。
+
+用一个更简单的类比替换掉 error:
+
+```go
+var x int          // x 存的是 int
+change(&x)          // 想修改 x，必须传 &x
+
+var target *NotFoundError  // target 存的是 *NotFoundError（一个指针）
+errors.As(err, &target)     // 想修改 target，必须传 &target（指针的指针）
+```
+
+`target` 本身是不是指针不影响这条规则——**只要你想让被调函数修改你的
+变量,永远是"传这个变量的地址",不管这个变量里装的是 int、struct 还是
+指针**。
+
+### 一句话串起来
+
+```text
+type NotFoundError struct{ ID int }
+func (e *NotFoundError) Error() string { ... }   // 方法挂在 *NotFoundError 上
+
+err := &NotFoundError{ID: 123}                    // err 本身就是 *NotFoundError
+var target *NotFoundError                         // target 用来接收结果，此刻是 nil
+errors.As(err, &target)                           // 把 target 的地址交给 errors.As 去写
+                                                   // → target 被赋值为 err 链条里的 *NotFoundError
+fmt.Println(target.ID)                            // 123
+```
+
+这跟"interface 隐式实现"是两个独立知识点,只是在错误处理这个场景里
+刚好碰到了一起。
+
+---
+
+## 31. `func (e *NotFoundError) Error() string` 语法拆解:这一行到底在做几件事
+
+延续第 30 节,把这行代码的语法本身再拆细一点,确认一个容易模糊的点:
+**方法不是"放在 struct 里面"的,而是"挂在某个类型上"的独立声明。**
+
+### 这一段代码其实是两个完全独立的声明
+
+```go
+type NotFoundError struct{ ID int }        // ① 定义一个 struct（只有字段）
+
+func (e *NotFoundError) Error() string {   // ② 单独给 *NotFoundError 挂一个方法
+    return fmt.Sprintf("item %d not found", e.ID)
+}
+```
+
+①和②是两条**互相独立的语句**,不是"struct 里面包含了一个方法"。严格
+来说不能说"`NotFoundError` 这个 struct 里面还有 `Error` 这个方法"——
+更准确的说法是:**`Error` 这个方法单独声明在别处,归属于 `*NotFoundError`
+这个类型**。这跟第 27 节"Go 没有类体,方法在类型定义之外独立声明"是
+同一件事,这里再确认一遍,避免以后被"方法在 struct 里"这种说法带偏。
+
+### receiver 部分拆开看
+
+```go
+func (e *NotFoundError) Error() string
+     └──────┬───────┘
+         receiver
+
+·  *NotFoundError → 这个方法属于谁（归属声明）
+·  e               → 方法体内代表"调用者自己"的变量名，等价 this
+```
+
+调用的时候:
+
+```go
+err := &NotFoundError{ID: 123}
+err.Error()   // 调用时 e = err，也就是 &NotFoundError{ID: 123}
+              // e.ID → 123
+              // 返回 "item 123 not found"
+```
+
+### 和 TS class 的对应关系(便于记忆,不是严格等价)
+
+| TS | Go |
+|---|---|
+| `class NotFoundError { ... }` | `type NotFoundError struct{ ... }` |
+| `this.id` | `e.ID` |
+| `error(): string { ... }`(写在 class 体内) | `func (e *NotFoundError) Error() string { ... }`(写在类型外部) |
+| `this` | `e` |
+
+唯一需要打破的直觉:TS 里 `error()` 必须写在 `class` 体内部,`this` 的
+类型别无选择;Go 里 `Error()` 写在 `NotFoundError` 定义之外的任意地方,
+全靠 `(e *NotFoundError)` 这一行显式声明归属——这也是第 27 节讲过的
+"receiver 才是把类型和方法绑在一起的那根线"。
+
+### 最后一步:为什么 `*NotFoundError` 自动就是 `error`
+
+标准库定义:
+
+```go
+type error interface {
+    Error() string
+}
+```
+
+`*NotFoundError` 有 `Error() string`,方法签名对上了,于是自动满足
+`error`——不需要任何"声明我要实现 error"的语法(第 28/29 节讲过的
+"完全隐式")。以后看到任何 `func (x *T) MethodName() ...`,都应该直接
+反应过来:"给 `*T` 类型挂一个叫 `MethodName` 的方法",而不是"`T` 里面有
+个叫 `MethodName` 的方法"。
+
+---
+
+## 32. 指针接收者里,`u.Name` 和 `*u` 到底什么关系(纠正一个误解)
+
+延续第 31 节,补一个重要纠正:**看到 `(u *User)` 这种指针接收者,不代表
+方法体里大概率要手写 `*u`。** `*u` 只有在你真的需要把指针指向的整个
+`User` 值取出来时才用得到。
+
+### 先分清三种写法
+
+```go
+u *User    // u 本身是一个指针
+*u         // 解引用：拿到指针指向的那个 User 值（真正的对象）
+u.Name     // 访问字段——Go 自动帮你解引用
+```
+
+### 平时最常见的场景:直接 `u.Name`,不需要 `*u`
+
+```go
+type User struct{ Name string }
+
+func (u *User) GetName() string {
+    return u.Name   // 等价于 (*u).Name，但 Go 允许省略 *
+}
+
+user := &User{Name: "Carlos"}
+user.GetName() // "Carlos"
+```
+
+`u` 拿到的是 `*User`(地址),但访问字段时 Go **自动解引用**,`u.Name`
+背后其实是 `(*u).Name`,只是不需要你手写出来。这条规则对方法调用本身
+也成立:`user.GetName()` 不需要写成 `(*user).GetName()`。
+
+### 什么时候才真的要写 `*u`
+
+只有你需要**把整个值取出来**(比如复制一份、整体替换、打印整个
+struct)的时候:
+
+```go
+func PrintUser(u *User) {
+    userValue := *u          // 把 u 指向的 User 整个值拿出来，赋值给一个新变量
+    fmt.Println(userValue)   // 打印的是 User{Name: "Carlos"} 这个值本身
+}
+```
+
+### 一句话记住
+
+看到 `func (u *User) GetName()`,不要理解成"方法里要用 `*u`",而是理解
+成:**"这个方法接收的是 `*User`,所以 `u` 是指针;但访问字段(`u.Name`)
+或调用方法时,Go 会自动帮你解引用,平时根本不需要手写 `*u`——只有真的要
+把整个值取出来时才用得上。"**
+
+---
+
 ## 踩坑记录(真实发生过的错误,留作参考)
 
 1. **同目录混用不同 package 名**:在 `05-goroutines-channels/` 里新建
