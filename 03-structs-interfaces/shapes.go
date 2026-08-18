@@ -1,5 +1,7 @@
 package shapes
 
+import "math"
+
 // TODO: implement each method/function below.
 // Run `go test ./03-structs-interfaces/...` to check your work.
 
@@ -11,7 +13,7 @@ type Rectangle struct {
 
 // Area computes the rectangle's area (Width * Height).
 func (r Rectangle) Area() float64 {
-	return 0
+	return r.Width * r.Height
 }
 
 // Circle is another plain data struct.
@@ -21,7 +23,7 @@ type Circle struct {
 
 // Area computes the circle's area (pi * r^2). Use math.Pi.
 func (c Circle) Area() float64 {
-	return 0
+	return math.Pi * c.Radius * c.Radius
 }
 
 // Shape is satisfied by any type with an Area() float64 method — no
@@ -32,5 +34,9 @@ type Shape interface {
 
 // TotalArea returns the sum of Area() across all shapes.
 func TotalArea(shapes []Shape) float64 {
-	return 0
+	total := 0.0
+	for _, shape := range shapes {
+		total += shape.Area()
+	}
+	return total
 }
