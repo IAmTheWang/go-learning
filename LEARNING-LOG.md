@@ -1580,6 +1580,156 @@ Node 单线程在 **CPU 密集**场景明显吃亏——一个耗时计算会长
 
 ---
 
+## 27. struct vs interface、方法到底"挂"在哪、receiver 命名规则
+
+补充(03-structs-interfaces 单元的问答,核对无误):
+
+### struct 和 interface 的分工不一样
+
+| | struct | interface |
+|---|---|---|
+| 描述什么 | 数据长什么样(字段) | 行为要满足什么(方法签名) |
+| 类比 TS | `type` 定义的对象类型 | `interface`,但满足关系是**隐式**的 |
+| 能不能实例化 | 能,`Rectangle{Width: 3, Height: 4}` | 不能,只能当变量/参数的类型来"装" struct |
+
+`interface` 是**结构化类型(structural typing)**,这点和 TS 的 interface
+反而很像:只要一个类型实现了 interface 要求的所有方法,就自动"满足"这个
+interface,不需要像 Java/C# 那样写 `implements`——Go 比 TS 走得更远,
+连"声明我要实现它"这个动作都没有,纯粹靠方法签名匹配。
+
+### `func (r Rectangle) Area() float64 {...}`——方法挂在哪
+
+```go
+func (r Rectangle) Area() float64 { return r.Width * r.Height }
+```
+
+这个方法**挂在 `Rectangle` 这个类型上,对所有 `Rectangle` 实例生效**,
+不是挂给某一个具体的 `r`。类比 TS:
+
+```ts
+class Rectangle {
+  area(): number { return this.width * this.height } // 挂在 prototype 上
+}
+```
+
+`(r Rectangle)` 这部分叫 **receiver 声明**,意思是"这个方法属于
+`Rectangle` 类型";`r` 只是方法体内代表"这次调用者自己"的局部变量,作用
+等价于 JS 的 `this`——区别是 Go 里它是显式命名的参数,且**是调用者的一份
+拷贝**(value receiver,见第 21 节"复印件 vs 钥匙")。同一个方法定义,
+`r` 在每次调用时绑定不同的实例:
+
+```go
+rect1 := Rectangle{Width: 3, Height: 4}
+rect2 := Rectangle{Width: 5, Height: 6}
+
+rect1.Area() // 调用时 r = rect1 的拷贝，算出 12
+rect2.Area() // 调用时 r = rect2 的拷贝，算出 30
+```
+
+### receiver 名字可以随便起,但有社区约定
+
+`r` 这个名字完全是自己起的,改成 `r1`、`rect`、随便什么合法标识符都行,
+编译器不关心。但社区约定(`go vet` 不强制,纯可读性习惯):
+
+- 一般用**类型名首字母的缩写**,尽量简短(1-2 个字母),不用 `this`/`self`
+  (`Rectangle` → `r`,`Circle` → `c`,`UserService` → `us`/`s`)。
+- **同一个类型的所有方法,receiver 名要保持一致**——`Rectangle.Area()`
+  用了 `r`,那 `Rectangle.Perimeter()` 也该用 `r`,不要来回换名字。
+
+---
+
+## 28. interface 的"完全隐式"到底是什么意思(结合 GPT 的补充理解)
+
+第 27 节留了一个坑:"完全隐式"这四个字第一次看很容易懵,因为它把
+"结构化类型""隐式满足""没有声明入口"三个概念揉在一起了。这里拆开、
+并把 receiver 的一个误解也顺带纠正。
+
+### 核心心法:interface 不看你是谁,只看你有没有对应方法
+
+```go
+type Shape interface {
+    Area() float64
+}
+```
+
+不要读成"只有声明自己是 Shape 的东西才能当 Shape",要读成:
+**"谁有 `Area() float64` 这个方法,谁就自动被当成 Shape。"**
+
+也可以理解成一种"入场条件":
+
+```text
+Shape 的入场条件：必须有 Area() float64
+
+Rectangle 有 Area() float64  →  满足 → 能进
+Circle    有 Area() float64  →  满足 → 能进
+Potato    有 Area() float64  →  满足 → 能进（哪怕名字听起来完全不像形状）
+```
+
+这就是经典的**鸭子类型（duck typing）**:"走路像鸭子、叫声像鸭子，那就
+当它是鸭子"——Go 判断的是能力（方法签名），不是名字或血统。
+
+### TS 和 Go 都是结构化类型,但 TS 多一道"可选的声明门"
+
+两边其实都不要求方法签名匹配之外的东西——这点是一样的:
+
+```ts
+interface Shape { area(): number }
+class Rectangle {                 // 没写 implements
+  area(): number { return 100 }
+}
+const s: Shape = new Rectangle()  // 依然合法，TS 也是结构化类型
+```
+
+区别在于 TS **额外给了你一个可以选择要不要用的声明入口**:
+
+```ts
+class Rectangle implements Shape { ... }
+```
+
+写了 `implements Shape` 之后,TS 会在**这个 class 声明的当下**就检查
+"有没有漏方法",漏了直接在这一行报错——相当于开发者主动立了个"我打算
+满足这个 interface"的flag,编译器帮你提前守门。
+
+Go 连这个"立 flag"的语法都没有:
+
+```go
+type Rectangle struct { Width, Height float64 }
+func (r Rectangle) Area() float64 { return r.Width * r.Height }
+// 这里没有任何地方能写"Rectangle implements Shape"，Go 也不提供这种语法
+```
+
+### 关键差异:检查发生在"声明时"还是"使用时"
+
+| | TS 写了 `implements` | TS 不写 `implements` | Go(永远没有这个选项) |
+|---|---|---|---|
+| 检查时机 | class 声明处,立刻检查 | 赋值给 `Shape` 类型变量时才检查 | **只有真正被当 Shape 用的那一刻**才检查 |
+| 读类型定义能否看出它满足哪些接口 | 能(看 `implements` 列表) | 不能 | **不能**,必须去翻方法、手动对着 interface 核对 |
+
+Go 的例子:
+
+```go
+type Dog struct{}
+func (d Dog) Area() float64 { return 123 } // Dog 自己完全不知道 Shape 的存在
+
+func PrintArea(s Shape) { fmt.Println(s.Area()) }
+
+PrintArea(Dog{}) // 编译器在这一行才检查：Dog 有没有 Area() float64？有 → 放行
+```
+
+所以更准确的说法不是"Rectangle 声明自己是 Shape",而是:
+**Rectangle(或 Dog)在被使用的那个场景里,被编译器临时证明满足了 Shape。**
+类型定义的时候,Go 根本不关心它以后会不会被当成某个 interface 用。
+
+### 顺带纠正一个 receiver 的误解
+
+上一节说"TS 的 `this` 已经定死,Go 没有",准确的意思是:TS 的方法**必须
+写在 class 体内部**,`this` 的类型由"你把方法写在哪个 class 里"这个语法
+位置决定,没得选;Go 没有类体,方法是在类型定义**之外独立声明**的普通
+函数,靠 `(r Rectangle)` 这一行显式声明"这个方法归 Rectangle 用"——
+类型和方法是两个独立的东西,receiver 声明才是把它们绑在一起的那根线。
+
+---
+
 ## 踩坑记录(真实发生过的错误,留作参考)
 
 1. **同目录混用不同 package 名**:在 `05-goroutines-channels/` 里新建
