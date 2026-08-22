@@ -2009,6 +2009,542 @@ func PrintUser(u *User) {
 
 ---
 
+## 33. `context` 到底是干什么的:跨 goroutine 的"遥控器 + 倒计时器"
+
+补充(来自和 Gemini 的讨论,核对无误):以 `ctx, cancel := context.WithTimeout(ctx, healthCheckTimeout)`
+这一行为例,拆解 `context` 包最容易卡住的几个点。
+
+### 一句话:`context` 是传递"停止信号"的统一通道
+
+一个请求/任务经常会拉起很多 goroutine 或子进程协同工作。如果某个任务卡死、
+超时,或者用户主动取消,没有一种机制通知"所有相关人员":别干了,撤!——
+就会产生大量孤儿 goroutine/子进程和内存泄漏。`context` 就是专门解决这个
+问题的:**只要函数里有耗时操作(网络请求、数据库查询、子进程调用),就应该
+把 `ctx` 传进去,随时准备接受"超时"或"取消"的指令。**
+
+真实场景(对应本仓库以后可能写到的健康检查/子进程调用):
+
+- **防止子进程死锁卡死**:启动时调用 `whisper-cli.exe --help` 探测环境,
+  如果这个子进程因为驱动问题永久卡死不返回——不用 `context` 的话,主线程
+  会无限期死等,前端页面永远转圈,整个后端假死。用了
+  `context.WithTimeout(ctx, 3*time.Second)`,3 秒一到自动发出取消信号,
+  `exec.CommandContext` 收到信号立刻杀掉子进程并返回错误,程序能优雅地
+  报出"预检超时"而不是卡死。
+- **用户主动取消任务**:前端点【取消】→ 调用这个任务对应的 `cancel()` →
+  `ctx` 状态变成"已取消"→ 正在监听 `ctx.Done()` 的 goroutine 停止工作、
+  子进程被连坐强杀、`defer` 里的清理逻辑(比如删临时文件)被触发。一路
+  信号传导下去,不需要手动挨个通知每一个参与者。
+
+### `ctx, cancel := context.WithTimeout(ctx, timeout)`——两个 `ctx` 是父子关系,不是同一个东西
+
+```go
+ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+//  ^^^ 子 ctx(新的)              ^^^ 父 ctx(旧的，作为参数传入)
+```
+
+- **右边的 `ctx`(父 Context)**:调用方传进来的原始 Context(比如
+  `context.Background()`,或者 HTTP 请求自带的 Context)。它自己可能没有
+  超时,或者超时时间更长。
+- **左边的 `ctx`(子 Context)**:`WithTimeout` 基于父 Context **派生**出的
+  全新对象。继承父 Context 的所有信息,额外绑定了一个"倒计时定时器"和
+  一个"手动取消开关"(`cancel`)。
+- **两个变量名都叫 `ctx`,是变量遮蔽(shadowing),不是同一个变量被"原地
+  修改"**。等价写法是 `childCtx, cancel := context.WithTimeout(parentCtx, timeout)`,
+  只是 Go 项目里约定俗成直接复用 `ctx` 这个名字,让后续代码自然而然用上
+  "更严格的那个新 ctx",不容易误用旧的、没有超时限制的父 ctx。
+
+**父 Context 会不会被销毁?**——不会立刻销毁。子 Context 内部结构体持有
+父 Context 的指针,即使变量名 `ctx` 现在指向了新对象,只要子 Context 还
+活着,父 Context 在内存里就依然完整存在,直到子 Context 也被回收。这跟
+GC 判断"能不能回收"的标准完全一致:看有没有任何东西还在引用它,和变量名
+有没有被遮蔽毫无关系。
+
+### `cancel` 是 Go 帮你写好的"取消开关",`Done()` 是原生的"信号接收口"
+
+- **`Done()`**:`context.Context` 接口**原生自带**的方法,返回一个
+  channel。Context 被取消或超时的那一刻,这个 channel 会被 `close()`。
+  `exec.CommandContext` 内部就是监听这个 channel 来决定要不要杀子进程。
+- **`cancel`**:`WithTimeout` 内部生成并返回给你的一个**闭包函数**
+  (类型 `context.CancelFunc`)。调用它,就会主动关闭对应 `ctx` 的
+  `Done()` channel,同时销毁绑定的定时器。
+- 两种触发方式效果完全一样:**主动**调用 `cancel()`,或者**被动**等到
+  超时时间耗尽——底层触发的都是同一套"关闭 `Done()`"逻辑。
+
+### 为什么必须 `defer cancel()`——防止定时器泄漏
+
+假设设置了 3 秒超时,但任务 0.5 秒就跑完了:如果不手动调用 `cancel()`,
+Go 内部的定时器依然会在内存里挂着,直到 3 秒真正走完才自动释放资源。
+`defer cancel()` 保证:不管函数是提前成功、中途报错、还是真的超时退出,
+函数一 return,定时器立刻被销毁,不会为"用不上的等待"白白占着资源。
+
+标准写法(三步缺一不可):
+
+```go
+ctx, cancel := context.WithTimeout(ctx, 3*time.Second) // 1. 派生带超时的子 ctx，拿到控制它的 cancel
+defer cancel()                                          // 2. 保证函数结束时立刻释放定时器
+cmd := exec.CommandContext(ctx, "whisper-cli.exe", "--help") // 3. 把子 ctx 传给耗时操作
+```
+
+### 为什么 `WithTimeout` 一定要返回 2 个值,不能只返回 `ctx`
+
+```go
+// 标准库签名：强制返回 2 个值
+func WithTimeout(parent Context, timeout time.Duration) (Context, CancelFunc)
+```
+
+```go
+ctx := context.WithTimeout(ctx, 3*time.Second)   // ❌ 编译报错：assignment count mismatch: 1 variable but context.WithTimeout returns 2 values
+ctx, _ := context.WithTimeout(ctx, 3*time.Second) // ⚠️ 语法能过，但等于主动放弃了释放定时器的能力，不推荐
+```
+
+这是 Go "强制显式"哲学(参见第 14 节)在这里的具体体现:故意让函数返回
+2 个值,在**语法层面**逼你必须接住 `cancel`,从而逼你想起来要写
+`defer cancel()`,而不是"希望开发者自觉记得清理资源"。
+
+### Go 和 TS 处理"同名变量"的区别(为什么 `ctx, cancel := ...(ctx, ...)` 在 Go 里合法)
+
+| | 同一作用域重复声明同名变量 | 嵌套作用域(`if`/闭包内)声明同名变量 |
+|---|---|---|
+| **Go(`:=`)** | 允许,只要右边**至少有一个新变量**(如 `cancel`)——旧变量被重新赋值,新变量被创建 | 在内层创建一个全新的同名变量,遮蔽外层同名变量,出了内层作用域外层变量恢复原样 |
+| **TS(`const`/`let`)** | **禁止**,直接 `SyntaxError`;想复用只能不带关键字重新赋值(`[ctx, cancel] = withTimeout(ctx)`) | 允许,同样是变量遮蔽,创建一个全新的内层变量 |
+
+两种语言在"嵌套作用域"下的遮蔽语义其实一致,差异只在**同一作用域**内
+能不能重新声明——Go 的 `:=` 只要求"至少一个新变量"就放行,这也是为什么
+`ctx, cancel := context.WithTimeout(ctx, timeout)` 这种"旧 ctx 参与、
+又重新声明 ctx"的写法在 Go 里完全合法且是惯用写法。
+
+---
+
+## 34. `ctx.Done()` 实战玩法、Channel 关闭规则、`close` 和 `Done()` 的区别
+
+补充(承接第 33 节,来自和 Gemini 的讨论,核对无误)。
+
+### `ctx.Done()` 的核心玩法:配合 `select` 监听"取消/超时"信号
+
+`ctx.Done()` 返回一个只读 channel(`<-chan struct{}`)。Context 存活期间
+这个 channel 一直阻塞;一旦被取消或超时,Go 底层 `close()` 这个 channel,
+所有卡在上面 `select` 的地方**同时**被唤醒。三种最常见的实战模式:
+
+**① "双响炮":等结果 vs 等超时(最常用)**
+
+```go
+resultChan := make(chan string)
+go func() {
+	time.Sleep(5 * time.Second)
+	resultChan <- "转录完成"
+}()
+
+select {
+case res := <-resultChan:
+	fmt.Println("成功:", res)          // 任务比超时快，正常拿到结果
+case <-ctx.Done():
+	fmt.Println("任务中止:", ctx.Err()) // 超时或被取消，ctx.Err() 会说明具体原因
+}
+```
+
+**② 循环 Worker 的"停机检查"**
+
+```go
+for {
+	select {
+	case <-ctx.Done():
+		fmt.Println("收到停止指令，退出 Worker")
+		return
+	default:
+		processNextItem()   // 没收到信号就继续跑下一轮
+	}
+}
+```
+
+**③ 开工前的"快检"(Pre-flight Check)**
+
+```go
+func DoHeavyWork(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()   // 排队期间已经被取消了，不做无用功
+	default:
+	}
+	// 正式开始耗时的重度计算...
+	return nil
+}
+```
+
+`exec.CommandContext(ctx, ...)` 内部本质上就是标准库悄悄帮你起的一个模式
+②:后台开一个 goroutine 卡在 `<-ctx.Done()` 上,一旦被唤醒就
+`cmd.Process.Kill()` 杀掉子进程。
+
+### `go func() { ... }()` 就是开一个 goroutine(并发)
+
+`time.Sleep(5*time.Second)` 那个例子里的 `go func() {...}()` 确实是并发——
+Go 术语叫 **goroutine**,运行时会把成千上万个 goroutine 自动调度到少数几个
+系统线程上跑,可以理解成"在后台开了一个异步任务"。
+
+### 常规业务代码到底要不要手写 `select + case <-ctx.Done()`?
+
+**日常写上层业务代码(HTTP 接口、查数据库、调第三方服务)时,绝大多数情况
+不需要自己手写。** 原因和边界:
+
+- **框架/标准库已经把 `select + Done()` 埋在底层了**:只要把 `ctx` 当参数
+  一路往下传("Context 传播"),`exec.CommandContext`、`db.QueryContext`、
+  `http.NewRequestWithContext` 这些函数内部早就写好了监听逻辑,取消会
+  自动生效,业务层完全不用感知。
+- **什么时候必须自己手写**:写**底层基础设施**、**后台常驻 Worker**、
+  **队列消费循环**、**自定义 SSE 推流**这类场景——没有现成的标准库函数
+  帮你监听,得自己在循环里加 `case <-ctx.Done()` 去通知协程退出。
+
+**框架封装好、完全不用手写 `select` 的真实例子(HTTP handler + 子进程)**:
+
+```go
+func TranscribeHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context() // 用户关闭网页，Go 的 HTTP Server 会自动 cancel 这个 ctx
+
+	// 完全没有 select，也没有 case <-ctx.Done()
+	cmd := exec.CommandContext(ctx, "ffmpeg.exe", "-i", "input.mp4", "output.wav")
+	if err := cmd.Run(); err != nil {
+		// 用户中途关闭页面时，ffmpeg 进程已被底层自动 Kill，
+		// err 会是 "signal: killed" 或包着 context.Canceled
+		http.Error(w, "转录被中断: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Write([]byte("转录成功"))
+}
+```
+
+开发者一行 `select` 都没写,但用户一关网页,`ffmpeg.exe` 就会被立刻杀掉——
+这就是"Context 传播"的价值:复杂的监听逻辑被标准库藏起来了。
+
+### 读/写已关闭的 Channel,规则各不相同(不会不分青红皂白就 panic)
+
+| 操作 | 结果 |
+|---|---|
+| **读**已关闭的 channel(`<-ch`) | **不会 panic**,立刻解除阻塞,返回该类型的**零值** |
+| **写**已关闭的 channel(`ch <- v`) | **会 panic**:`panic: send on closed channel` |
+| **重复 `close`** 同一个 channel | **会 panic**:`panic: close of closed channel` |
+
+正因为"读已关闭的 channel 会立刻返回零值、不阻塞、不 panic",Go 底层
+取消 Context 时只需要 `close(ch)` 这一个动作,所有卡在 `<-ctx.Done()`
+上的 goroutine 就会**同时**被唤醒——不需要给每个等待者单独发一份数据。
+
+想区分"读到的是正常发来的值"还是"channel 被关闭后的零值",用 comma-ok:
+
+```go
+val, ok := <-ch
+// ok == true  → 正常收到的数据
+// ok == false → ch 已经被 close()，val 是零值
+```
+
+### `close` 和 `Done()` 不是一回事——一个是动作,一个是方法
+
+- **`close`**:Go **内置函数**,是一个**动作**。`close(ch)` 把某个 channel
+  标记为"已关闭"状态,这个函数本身不属于 `context` 包,是 channel 通用的
+  操作。
+- **`Done()`**:`context.Context` 接口上的一个**方法**,不负责关闭,只是
+  **把内部那个用来接收停止信号的只读 channel 交给你**,让你拿去 `select`
+  监听。
+
+两者的联系:调用 `cancel()` 时,Go 在 `context` 包内部帮你执行的正是
+`close(该 ctx 内部的 channel)`;外部代码通过 `<-ctx.Done()` 读到这次
+`close` 触发的"零值 + 立即返回",从而感知到取消信号——`cancel()` 只是
+把"`close` 这个通用 channel 操作"包了一层,专门用在 Context 取消这个
+场景里。
+
+---
+
+## 35. `r`/`w` 是谁提供的、`Cancel`/`Done`/`Close` 关系比喻、为什么 `Done()` 这个命名容易误导
+
+补充(承接第 33、34 节,来自和 Gemini 的讨论,核对无误)。
+
+### `r.Context()` 是谁定义的?`r`、`w` 分别是什么
+
+`r`、`w` 是 `net/http` 包(标准库)在调用你的 handler 函数时传进来的两个
+固定参数,不是你自己发明的东西:
+
+- **`w`(`http.ResponseWriter`)**:响应输出口(接口),负责往客户端写
+  数据——设置状态码、写 header、吐出 JSON/HTML 字符串。
+- **`r`(`*http.Request`)**:请求数据包(指针结构体),装着客户端发来的
+  一切信息(URL 参数、请求头、POST body)。
+- **`r.Context()`**:`*http.Request` **自带的原生方法**,返回这次 HTTP
+  请求生命周期绑定的 Context。用户中途关闭网页时,Go 的 HTTP Server 会
+  自动帮你 cancel 掉这个 Context——不需要你自己去检测"连接断了"。
+
+### `Cancel` / `Close` / `Done` 关系比喻:"限时施工许可证"
+
+把后台任务(goroutine)想象成一支施工队,`Context` 是一张带截止日期的
+**施工许可证**:
+
+- **`Done()`**:不是普通聊天频道,而是"**许可证是否已作废**"这条专用
+  警铃线路的接听口——`ctx.Done()` 返回的就是这条线。
+- **`<-ctx.Done()`**:施工队一边干活一边盯着这个警铃。平时不响就继续干;
+  警铃一响,就说明**这张许可证的寿命到头了**(不管是到期还是被作废)。
+- **`cancel()`**:监理跑过去**主动拉响**警铃,提前宣布许可证作废
+  (对应用户手动取消)。
+- **`close()`**:警铃真正响起来的**物理机制**——把警铃线路的保险丝
+  熔断(`close` 掉 channel)。熔断之后线路会**一直**处于"响着"的状态
+  (读取立刻返回零值,不会只响一下就没了),所有正在监听的施工队都能
+  听到,不管他们是早就在等还是刚开始等。
+
+串起来:
+
+1. 看名字:`Done()` 就是在问"这张许可证寿命是不是 **到头了**(Done)?"
+2. 看动作:`<-ctx.Done()` 就是"守着警铃,等它响"。
+3. 看触发源:警铃响,可能是**倒计时自然到期**(`WithTimeout` 内部定时器
+   触发),也可能是**监理手动拉响**(调用 `cancel()`)——两条路径最终
+   都走到同一个 `close(ch)` 动作上。
+4. 看结果:警铃一响,施工队(goroutine)立刻放下工具撤离(退出循环、
+   杀掉子进程、清理资源)。
+
+(此前用过"无线电对讲机"打比方,只讲清楚了 channel 的通信机制,没讲清楚
+`Done` 到底"完成的是什么"——已弃用,以上"施工许可证"版本更准确。)
+
+### 为什么 `Done()` 这个命名容易让人理解反了
+
+第一次看到 `Done()`,几乎所有人都会下意识理解成**任务视角**:"我的转录
+任务 Done(做完)了!"——但 Go 真正的意思是**Context 视角**:"这个
+Context 的**生命周期** Done(结束)了!" 两者常常刚好相反:任务被取消
+或超时失败,恰恰也会让 `ctx.Done()` 触发,不代表任务"成功完成"。
+
+"生命周期结束"只有两种触发原因,配合 `ctx.Err()` 可以查具体是哪一种:
+
+```go
+select {
+case <-ctx.Done():
+	if errors.Is(ctx.Err(), context.Canceled) {
+		fmt.Println("作废原因：用户手动取消了")       // 对应"监理拉响警铃"
+	} else if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		fmt.Println("作废原因：超时倒计时归零了")     // 对应"许可证自然到期"
+	}
+}
+```
+
+如果 Go 当初命名成 `ctx.Expired()`(已失效)或 `ctx.Terminated()`(已
+终止),会比 `Done()` 直觉得多——但官方追求命名极致简洁,选择了这个更容易
+被误读成"任务完成"的短词。记忆窍门:**看到 `Done()`,先在心里翻译成
+"这张通行证到期了吗?",而不是"活干完了吗?"**
+
+---
+
+## 36. `cancel` 与 `close` 的因果关系、幂等锁保护、字段 vs 方法(懒加载)、`nil` channel 为什么会卡死
+
+补充(承接第 33~35 节,来自和 Gemini 的讨论,核对无误)。这一节是目前
+关于 `context`/channel 底层原理挖得最深的一次,把源码级细节和几个容易
+误解的语法点放在一起整理。
+
+### `cancel` 和 `close` 是"封装"+"因果"关系,不是同一层东西
+
+- **`cancel`**:`context` 包提供给使用者的高层 API(类型
+  `context.CancelFunc`),是一个**函数**。
+- **`close`**:Go **内置函数**,专门用来关闭 channel,是更底层的通用
+  操作,跟 `context` 包本身没关系。
+- **因果链**:你调用 `cancel()`(因)→ `cancel()` 内部执行
+  `close(c.done)`(果)→ 所有卡在 `<-ctx.Done()` 上的 goroutine 被唤醒。
+  `cancel()` 本质上就是把 `close(某个 channel)` 包了一层,专用在
+  "Context 取消"这个场景里。
+
+**为什么不让你直接 `close(ctx.Done())`?**——`Done()` 返回的是只读
+channel(`<-chan struct{}`),Go 语法层面就禁止对只读 channel 调用
+`close()`,编译都过不了。这么设计是故意的:
+1. 防止外部代码乱传/误关闭这个 channel,破坏 Context 内部状态;
+2. 重复 `close` 同一个 channel 会 panic,把关闭这个动作**收进
+   `cancel()` 内部**,才能统一加上"幂等保护",不管外部调用多少次
+   `cancel()` 都绝对安全。
+
+### 幂等锁保护——保证多次调用效果和调用一次完全一样
+
+**幂等(Idempotent)**:同一个动作执行 1 次和执行 100 次,效果完全一样,
+不会有额外副作用。`cancel()` 必须做成幂等的,因为真实并发场景里,用户
+点取消、超时倒计时归零、上游 Context 被取消,可能在同一毫秒被多个
+goroutine 同时触发,如果每次都无脑执行一遍 `close()`,第二次就直接
+panic(`close of closed channel`)。
+
+标准库简化后的逻辑:
+
+```go
+c.mu.Lock()
+if c.err != nil {
+	c.mu.Unlock()
+	return // 已经有人取消过了，直接啥也不做，绝不二次关闭
+}
+c.err = Canceled
+close(c.done) // 只有第一次调用能走到这一行
+c.mu.Unlock()
+```
+
+逐行意义:
+1. `c.mu.Lock()`:上锁,保证同一时刻只有一个 goroutine 能执行下面的
+   判断+关闭逻辑,防止两个 goroutine 同时看到"还没取消"而都去 `close`。
+2. `if c.err != nil { ...; return }`:判断"是不是已经有人取消过了"——
+   `c.err` 一开始是 `nil`,一旦被取消就会被赋值成 `Canceled`,后来者
+   看到非 `nil` 就直接退出,啥也不做。**这就是幂等的核心**:整段代码
+   唯一目的就是保证 `close(c.done)` 有且仅执行一次,避免 panic。
+3. `c.err = Canceled`:第一次到达这里的调用者,先把状态"盖章"标记好。
+4. `close(c.done)`:真正关闭 channel,唤醒所有监听者——因为前面的
+   判断,这一行绝对不会被执行第二次。
+5. `c.mu.Unlock()`:释放锁。
+
+### `done`(小写字段)和 `Done()`(大写方法)为什么要分开定义
+
+- **`done`**:`cancelCtx` 结构体内部的**私有字段**,是真正存在内存里
+  的原始 channel,外部代码访问不到。
+- **`Done()`**:对外公开的**方法**,你调用 `ctx.Done()` 拿到的就是它
+  的返回值。
+
+分开定义的两个原因:
+
+**① 读写权限隔离**——原始 `done` 字段本身是可读可写也可以被关闭的
+普通 channel,如果直接暴露给外部,外部代码可能手滑写数据或者
+`close(ctx.done)`,直接搞崩内部状态。公开方法 `Done()` 把返回值声明成
+`<-chan struct{}`(只读),从语法层面切断了外部写入/关闭的可能。
+
+**② 懒加载(Lazy Initialization),省内存**——很多派生出来的 Context
+只是用来传值(`context.WithValue`),根本用不到取消功能。如果每个
+Context 一创建就无脑 `make(chan struct{})`,大量不需要取消能力的
+Context 会白白分配内存。所以标准库让 `done` 初始值为 `nil`,只有第一次
+**调用** `Done()` 方法时,才现场把 channel 真正 `make` 出来。
+
+**为什么"分成方法+字段"才能省内存,只有字段不行?**——核心在于
+**字段是死数据,方法是活代码**:
+
+```go
+x.Y     // 字段:纯粹的内存读取，只能原样拿到当前存的值（nil 就是 nil），
+        // 不能在读取的瞬间"顺便执行一段判断逻辑"
+x.Y()   // 方法(带括号=函数调用):CPU 会跳进这个函数体去执行里面的代码，
+        // 可以写 if/else、加锁、动态 make() 等任意复杂逻辑
+```
+
+如果 `Done` 是纯字段直接暴露(`ctx.DoneChan`),想读到非 `nil` 的值,
+就必须在**创建 Context 的那一刻**就强行分配内存,没有"等真正用到才创建"
+的机会——因为字段读取这个动作本身不会触发任何代码执行,标准库设计者压根
+没有地方能插入"发现是 nil 就 make 一个"的判断。而 `Done()` 做成方法之后,
+设计者可以在方法体内部写:
+
+```go
+func (c *cancelCtx) Done() <-chan struct{} {
+	d := c.done.Load()              // 原子读取，判断有没有已经创建过
+	if d != nil {
+		return d.(chan struct{})    // 已经有了，直接返回
+	}
+	c.mu.Lock()
+	if c.done.Load() == nil {
+		c.done.Store(make(chan struct{})) // 第一次用到，现场分配内存
+	}
+	c.mu.Unlock()
+	return c.done.Load().(chan struct{})
+}
+```
+
+- `c.done.Load()`:`atomic.Value` 类型自带的方法,**无锁**、并发安全地
+  读取当前存的值——多个 goroutine 同时读写同一个变量而不加锁,会触发
+  Go 的数据竞争(data race);`atomic.Value` 专门用来在不加锁的情况下
+  安全地存取一个值。
+- `.(chan struct{})`:**类型断言**。`atomic.Value.Load()` 返回的是万能
+  类型 `interface{}`(类似 TS 的 `any`/`unknown`),但 `Done()` 声明的
+  返回类型是具体的 `<-chan struct{}`,所以要用 `.(chan struct{})` 告诉
+  编译器"我确定这个 `any` 底下装的就是这个具体类型,请转换回去给我"。
+
+一句话:`x.Y` 里的 `Y` 名字确实是写死的,"能不能改"从来不是重点——重点
+是 `Y` 到底是"只能原样交出数据的字段",还是"能在被调用那一刻执行一段
+自定义逻辑的方法"。懒加载依赖的正是后者这份"执行能力"。
+
+### `nil` channel:读写会永久卡死,不是 panic,但同样是严重 bug
+
+Go 里 channel 有三种状态,读/写/关闭的行为完全不同,这张表是最容易出
+新手 bug 的地方,建议直接背下来:
+
+| Channel 状态 | 读(`<-ch`) | 写(`ch <- v`) | 关闭(`close(ch)`) |
+|---|---|---|---|
+| **`nil`(未初始化)** | **永久阻塞** | **永久阻塞** | **panic** |
+| **正常开启(open)** | 阻塞直到有数据/被关闭 | 阻塞直到有人接收 | 正常关闭 |
+| **已关闭(closed)** | **立刻返回零值**(不阻塞) | **panic** | **panic**(重复关闭) |
+
+```go
+var ch chan struct{}   // ch == nil，没有分配任何内存
+
+go func() {
+	<-ch                        // 走到这里，这个 goroutine 瞬间永久休眠
+	fmt.Println("永远不会被打印")   // 永远执行不到
+}()
+```
+
+**为什么是"卡死"而不是"panic"**:读 `nil` channel 时,运行时找不到任何
+有效的数据/等待队列结构,只能把当前 goroutine 挂起等待被唤醒——但因为
+`ch` 是 `nil`,**没有任何代码能往一个 `nil` channel 发数据或关闭它**,
+于是这个 goroutine 永远等不到唤醒信号,永久睡死过去。
+
+**这算不算 panic,取决于卡死的是谁**:
+- 卡在**主 goroutine**、且后台没有其他可运行协程:Go 运行时会检测到
+  "所有协程都睡死了",直接抛出 `fatal error: all goroutines are asleep - deadlock!` 并终止程序。
+- 卡在**后台子 goroutine**:程序完全不报错、不 panic,这个协程像幽灵一样
+  永远占着内存,直到进程退出——这就是**goroutine 泄漏(goroutine leak)**,
+  没有报错但持续吃内存,比直接崩溃更难排查。
+
+**这种写法在生产代码里 100% 是严重 bug**:每次触发都会永久扣住至少
+2KB 栈内存 + 闭包捕获的所有对象;Go 的 GC 认为这个协程"理论上还可能被
+唤醒",不会回收它;而且没有任何报错信息,只会悄悄把内存吃光,直到 OOM。
+
+**`nil` channel 唯一的正当用法:在 `select` 里动态"关闭"一个分支**——
+Go 把"读写 nil channel 永久阻塞"这个特性反过来用,做成了"让 `select`
+永久跳过某个 case"的技巧:
+
+```go
+for {
+	select {
+	case msg, ok := <-ch1:
+		if !ok {
+			ch1 = nil   // 把已关闭的 ch1 设成 nil
+			continue    // select 从此永远不会再选中这个 case，等价于禁用这个分支
+		}
+		fmt.Println("来自 ch1:", msg)
+	case msg := <-ch2:
+		fmt.Println("来自 ch2:", msg)
+	}
+}
+```
+
+如果不做这一步,`ch1` 被关闭之后 `<-ch1` 会**立刻**返回零值(不阻塞),
+`select` 会疯狂地一直选中这个已经没用的 case,把 CPU 干到 100%;把
+`ch1` 设成 `nil` 之后,这个 case 上的读操作变成永久阻塞,`select` 就
+再也不会选它,相当于"关掉"了这个分支,只留下 `ch2` 继续正常工作。
+
+### `go func(){...}()` 的执行顺序(主协程 vs 子协程)
+
+```go
+var ch chan struct{}
+go func() {
+	<-ch
+	fmt.Println("永远不会被打印")
+}()
+```
+
+1. 主协程先声明 `ch`(此时是 `nil`);
+2. 执行到 `go func(){...}()`,只是把这个函数**注册**给 Go 运行时去调度,
+   这一步本身**不阻塞**——主协程立刻往下执行自己后面的代码,完全不等
+   子协程跑没跑、跑到哪。
+3. 子协程什么时候真正开始执行,由 Go 调度器决定(可能几乎同时,也可能
+   稍晚),跟主协程是两条独立的执行流。
+4. 子协程执行到 `<-ch` 时发现是 `nil`,永久阻塞,后面的 `fmt.Println`
+   永远执行不到。
+5. 最终命运:如果主协程跑完导致整个进程退出,这个卡住的子协程跟着一起
+   消失;如果主程序是长期运行的服务(比如 HTTP server),这个子协程就
+   会一直卡在内存里造成泄漏。
+
+### `select` 里 `case msg, ok := <-ch1:` 的 `ok` 到底是什么
+
+`ok` 是布尔值,专门用来区分"这次读到的值是不是有效数据",跟第 5 节
+`v, ok := m[key]`(map 的 comma-ok)是同一套惯用法:
+
+- `ok == true`:channel 正常开着,且真的有人发了数据过来,`msg` 是
+  对方发来的真实值。
+- `ok == false`:channel 已经被 `close()` 了,`msg` 拿到的是该类型的
+  **零值**(不是真实数据),因为已关闭的 channel 读取会立刻返回零值
+  而不阻塞(见上面的状态表)。
+
+不写 `ok`、只写 `msg := <-ch1`,一旦 `ch1` 被关闭,`select` 会以极高
+频率不断读出零值、不断选中这个 case,直接把 CPU 打满;配合 `ok` 判断
+把已关闭的 channel 设为 `nil`(见上一小节),才能让这个分支真正停下来。
+
+---
+
 ## 踩坑记录(真实发生过的错误,留作参考)
 
 1. **同目录混用不同 package 名**:在 `05-goroutines-channels/` 里新建
