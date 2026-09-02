@@ -23,7 +23,7 @@ OMRON connect（序列号机制）───────┤
 タニタ（序列号机制）─────────────┤
 アークレイ e-SMBG（游标机制）────┼──▶  DDA（认证 + 拉取 + 格式转换）  ──▶  FHIR Observation
 Abbott フリースタイルリブレ ──────┤                                        （+ 内部 lifelogs 表）
-A&D（已下线，见下文）────────────┤
+A&D（活跃集成，见下文更正说明）──┤
 MeDaCa ───────────────────────────┘
 ```
 
@@ -71,12 +71,94 @@ Adapter/转换器角色。
 | Fitbit | 用户级 OAuth token（会过期，见下文） | 无状态滑动窗口（今天+昨天，见 [fitbit-cursor-vs-sliding-window.md](./fitbit-cursor-vs-sliding-window.md)） |
 | OMRON connect / タニタ | app 级 API Key | 序列号机制 |
 | アークレイ（e-SMBG）/ MeDaCa | app 级 API Key | 游标（cursor）机制 |
-| A&D | app 级 API Key（提供方已下线，见下文） | 曾经存在，2025-09-09 从前端移除 |
+| A&D | app 级 API Key（OAuthクライアント，见下文更正说明） | 与其他厂商类似的批处理拉取机制 |
+
+> ⚠️ **更正（2026-09-02）**：本表先前记载"A&D 提供方已下线、2025-09-09 从前端移除"，
+> 与实际情况不符，特此更正。
+>
+> **纠错依据**：2026-09-02 因 TISI e9 调查，重新核实了 A&D 的现状——
+> 1. `welby-device-data` 仓库里 A&D 有完整、真实在跑的 OAuth 批处理集成
+>    （`aandd_usecase.go` 的 `AanddUsecase.CreateLifelogs()`、`aandd_api_repository.go`
+>    里对接 A&D 官方 `wellnessconnected` API 的 OAuth client、ECS 定时批处理任务），
+>    跟 Fitbit/OMRON Connect 等厂商属于同一量级的现役实现，不是遗留死代码。
+> 2. 生产环境（`karte.welby.jp`）实测截图确认，`welby-phr-web` 患者详情页
+>    ライフログ（歩数）厂商筛选下拉框里，"A&D" 现在依然是可选项。
+>
+> **旧记录可能的错误成因**：`dda-incident-secrets-and-rule-ops.md` 记录的
+> 2026-08-25 DDA 故障中，Fitbit/OMRON/アークレイ/MeDaCa/タニタ/A&D 这 6 个
+> vendor batch 都曾因 `codedeploy.sh` 漏配置密钥（secrets 变空 → 401）而被
+> **临时手动 DISABLE 调度 rule**（纯运维止血手段，PR #105 修根因后已重新
+> ENABLE 恢复）。若当时的记录把"临时 DISABLE"误判成"永久下线"，就会得出
+> 错误结论——这是混淆了"运维层面的临时止血动作"和"业务层面的永久下线决策"
+> 这两件性质完全不同的事。
+>
+> 但该故障发生在 **2026-08**，与旧记录标注的 **2025-09-09** 时间线对不上，
+> 所以这次故障并非旧记录错误的直接来源，具体错误源头已不可考——仅记录
+> "临时 DISABLE 容易被误读成永久下线"这个通用教训，供以后类似排查参考。
 
 DDA 要为每一家单独写一套"怎么认证、怎么分页、断连了怎么补数据"的适配逻辑——
 这就是为什么 2026-08 那次故障里，同样是"secrets 变空"，タニタ/アークレイ/
 MeDaCa 靠 rule 重新 enable 就能自动补数据，Fitbit 却需要单独写 backfill 脚本
 （同一个故障原因，各厂商适配层的容错能力完全不同）。
+
+## OAuth 是什么：A&D/Fitbit 这类"用户级授权"背后的机制
+
+上面表格里 Fitbit、A&D 用的"OAuth token"，跟 OMRON/タニタ用的"app 级 API Key"
+不是一回事——这里专门展开讲清楚 OAuth 到底是什么、为什么要用它。
+
+**名字由来**：OAuth = **Open Authorization**（开放式授权）。2007 年由
+Blaine Cook（当时在 Twitter）、Chris Messina 等几位工程师发起，起因是
+Twitter 和 Ma.gnolia（已停运的社会化书签网站）都在各自开发类似的第三方
+授权机制，几个工程师觉得"与其各自造轮子，不如一起定一个开放标准"。
+2010 年正式发布为 **RFC 5849**（OAuth 1.0）。"Open"强调的是这是一套公开、
+通用的标准，任何公司都能按这套标准实现自己的授权系统，不同系统之间因此
+能互相理解、互相对接。
+
+**要解决的问题**：让第三方应用（Welby）能访问用户在另一个平台（A&D/Fitbit）
+上的数据，又不需要用户把密码直接告诉第三方——类似"给快递员一张临时授权码
+进小区放包裹，而不是把家里钥匙给他"。
+
+**OAuth 1.0 vs 2.0（2012 年，RFC 6749，主导者 Eran Hammer）**：
+
+- **1.0**：每次请求都要用共享密钥对内容做一次 HMAC-SHA1 加密签名一起发送，
+  接收方重新计算签名比对——签名本身自带防伪能力，即使传输链路某个环节不够
+  安全，内容被篡改也能被发现。
+- **2.0**：放弃逐条签名，改成"持有令牌（bearer token）即视为有权限"，安全性
+  完全依赖 HTTPS 加密传输这一层。Eran Hammer 本人后来公开退出工作组并撰文
+  批评：2.0 为了让大公司（Google/Facebook 等）接入更灵活、更简单，牺牲了
+  1.0 更严谨的密码学签名保护，是"从工程师标准变成了企业标准"的妥协。
+  **现在互联网上绝大多数系统（包括 Welby 对接 A&D 用的这套）都是 OAuth 2.0**，
+  1.0 已基本被淘汰。
+
+**在 DDA 里具体怎么用（以 A&D 为例，代码实证）**：
+
+```
+1. 患者在 A&D 官网上完成 OAuth 授权（同意"允许 Welby 读取我的数据"）
+   → welby-device-data 拿到这个患者的 access token
+     （aandd_api_repository.go 里的 OAuth client，用 AANDD_CLIENT_ID /
+      AANDD_CLIENT_SECRET 向 A&D 的 wellnessconnected/oauth/token 换 token）
+
+2. ECS 定时批处理任务（每隔一段时间自动醒来，不需要人工触发）
+   → 拿着 token 调用 A&D 官方 API（AanddUsecase.CreateLifelogs()）
+   → 抓回这个患者最新的原始测量数据
+
+3. 数据经 DDA 转换 → 写入 FHIR Observation + 内部 lifelogs（见上文"输出端"）
+```
+
+**跟"secrets"的区别**（呼应 [dda-incident-secrets-and-rule-ops.md](./dda-incident-secrets-and-rule-ops.md)
+里的表格）：`AANDD_CLIENT_ID`/`AANDD_CLIENT_SECRET` 这类是 **app 级 secrets**
+（Welby 系统证明"我是 Welby"，跟具体患者无关，属于整个应用），而每个患者
+授权后拿到的 access/refresh token 是**用户级 OAuth token**（属于患者个人）——
+这是两种完全不同层级的凭证，2026-08 那次故障里出问题的是前者（app 级
+secrets 被部署脚本漏配置成空值），Fitbit 那 252 人 token 过期是后者的问题，
+两者互不相关，排查时容易搞混。
+
+**Sandbox（测试）密钥**：A&D/OMRON 这类厂商通常会给开发者提供两套账号——
+**生产密钥**对接真实用户数据，管控严格；**sandbox/测试密钥**对接厂商专门
+开放的假数据环境，可以随便调用、随便试错，不会碰到任何真实患者信息，是
+开发者验证"OAuth 对接代码写得对不对"的标准做法。目前 `welby-device-data`
+的环境搭建文档完全没写清楚"去哪申请 A&D 的 sandbox 密钥"这一步，这是
+e14（导入手順书）调查里发现的一个具体缺口。
 
 ## 输出端：FHIR 只是其中一半，还有一份内部 lifelogs
 
@@ -246,7 +328,8 @@ WPDP 平台的通用医疗记录产品，サイログ 是给 Amgen 甲状腺患�
 
 外部审计方关心的"機器連携取得情報一覧"文档，本质就是要一份**准确的"输入端
 清单"**——现在到底接了哪几家厂商。这份清单会过时，正是因为 DDA 的输入端
-（厂商列表）会随业务变化而增减（A&D 2025-09 下线、MeDaCa 2025-12 上线），
+（厂商列表）会随业务变化而增减（MeDaCa 2025-12 上线；A&D 曾被误记录为
+"2025-09 下线"，实际仍在活跃使用中，见上文更正说明），
 但输出端（FHIR/lifelogs 的格式）相对稳定，不会跟着每次厂商增减而变——所以
 外部视角容易忽略"这份清单该更新了"，因为系统整体"看起来"照常运作，没有明显
 故障信号。
