@@ -1,5 +1,7 @@
 package errorsinterfaces
 
+import "fmt"
+
 // TODO: implement each function/method below.
 // Run `go test ./07-errors-interfaces/...` to check your work.
 
@@ -20,7 +22,7 @@ type NotFoundError struct {
 // method signature IS an error — no "implements" keyword, no inheritance).
 func (e *NotFoundError) Error() string {
 	// TODO: return a message like "item 42 not found" (use fmt.Sprintf)
-	return ""
+	return fmt.Sprintf("item %d not found", e.ID)
 }
 
 // FindItem looks up id in items. If missing, return a *NotFoundError
@@ -33,7 +35,11 @@ func (e *NotFoundError) Error() string {
 //	}
 func FindItem(items map[int]string, id int) (string, error) {
 	// TODO
-	return "", nil
+	val, ok := items[id]
+	if !ok {
+		return "", &NotFoundError{ID: id}
+	}
+	return val, nil
 }
 
 // LoadItemConfig calls FindItem and, on failure, wraps the error with added
