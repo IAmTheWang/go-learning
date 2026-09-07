@@ -323,6 +323,18 @@ WPDP 平台的通用医疗记录产品，サイログ 是给 Amgen 甲状腺患�
   的主营业务是精密电子元件（传感器、PLC 工业自动化）和**家用血压计/体重体
   脂秤等健康设备**（全球家用血压计市场份额第一）——后者才是它出现在这次
   "设备连携"厂商列表里的真正原因。
+- **アークレイ（Arkray）**：日本的医疗检测设备公司，总部京都，主营血糖仪
+  （SMBG，Self-Monitoring of Blood Glucose，自我血糖监测）和尿液检测仪。
+  产品线叫"グルコカード（Glucocard）"系列——`welby-phr` 的
+  `public/patient/cooperation.html` 里列的具体支持型号是「グルコカード
+  Gブラック、グルコカードプラスケア、グルコカードプライム」这几款。
+  在 `welby-device-data` / `welby-phr` 这两个仓库的"设备连携"列表里，
+  Arkray 对应的服务叫 **e-SMBG**（`welby-phr` 显示为"スマートe-SMBG"，
+  `SERVICE_TYPE.ARKRAY = 5`）——先用厂商自己的"スマートe-SMBG" App 连上
+  血糖仪，再让这个 App 跟 Welby 账号做二次连携，数据流转模式跟 OMRON
+  connect 是同一套（先厂商 App，后 Welby 二次授权），可以对照着理解。
+  在 DDA 的同步机制里，Arkray 用的是**游标（cursor）机制**而不是 OMRON/
+  タニタ那种序列号机制（见上文"轮询参数每家不一样"一节）。
 
 ## 为什么这套"多进一出"的设计对 TISI 审计/e9 调查很重要
 
