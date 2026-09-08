@@ -3178,3 +3178,37 @@ function withdraw(balance: number, amount: number) {
 **不是**。这个理念至少能追溯到 1970 年代的 C 语言(靠返回值 `0`/`-1`/`NULL` 表达成功/失败),函数式语言里也早有先例(Erlang 的 `{:ok, Data}`/`{:error, Reason}` 元组、Haskell/Rust 的 `Result` 类型)。
 
 Go 的贡献不是"发明",而是在主流语言(Java/C#/Python/JS)纷纷转向 `try/catch` 异常机制的年代,**坚持并规范化了 C 的老传统**:靠原生支持的多返回值 `(value, err)`,把"显式检查错误"变成一个统一、强制的语言级书写范式(`if err != nil`),让这套本来分散、随意的做法变成了现代语言里一个有名有姓、成体系的哲学标签。这也符合 Go 的设计者背景——Ken Thompson(C 语言联合创作者之一)也是 Go 的设计者之一,这条选择更像是"回归并打磨" C 的哲学,而不是从零发明。
+
+---
+
+## 41. `val, ok := ...` 双返回值语法只出现在 3 种固定场景,不是"结构体属性访问"的通用规则
+
+### 容易搞混的点:`arg.(fmt.Stringer)` 不是在读结构体字段
+
+`arg.(fmt.Stringer)` 是**类型断言**(Type Assertion),语法是`接口变量.(目标类型)`——只能用在**接口类型**的变量上,检查它底层实际存的值是否实现了某个接口/属于某个具体类型。这跟用点号访问结构体字段(`p.Name`)是完全不同的两种机制,只是长得都有个点号,容易联想到一起。
+
+### 结构体字段访问:永远只有 1 个返回值
+
+```go
+type Person struct {
+    Name string
+}
+p := Person{Name: "张三"}
+name := p.Name // 正确:只返回 1 个值
+
+// name, ok := p.Name  // ❌ 编译报错:assignment mismatch: 2 variables but 1 values
+```
+
+如果字段根本不存在,Go 编译器在**编译阶段**就直接报错(`p.Age undefined (type Person has no field or method Age)`),连"运行时判断存不存在"这件事都不需要发生——字段是不是存在,是类型系统在编译期就能确定死的事,不需要留到运行时用 `ok` 去试探。
+
+### 真正支持 `val, ok` 的只有 3 种固定场景
+
+| 场景 | 写法 | `ok` 的含义 |
+|---|---|---|
+| 接口类型断言 | `stringer, ok := arg.(fmt.Stringer)` | `arg` 底层的值是否实现了 `fmt.Stringer` 接口 / 是否是某个具体类型 |
+| map 查找 | `val, ok := m["age"]` | key 是否存在(不存在时 `val` 是该值类型的零值,`ok` 为 `false`) |
+| channel 接收 | `val, ok := <-ch` | channel 是否还开着(已 `close` 且缓冲区排空后 `ok` 为 `false`) |
+
+这三种场景的共同点:**运行时才能确定的、可能失败的读取操作**——接口里到底装的是什么具体类型、map 里到底有没有这个 key、channel 到底关没关,都不是编译期能算出来的事,所以 Go 需要一个显式的 `ok` 布尔值把"这次读取到底有没有成功"暴露出来,而不是悄悄给你一个零值糊弄过去(对比 JS:`obj.notExistKey` 静默返回 `undefined`,`map.get("不存在的key")` 也是静默返回 `undefined`,都不会告诉你"到底是真的存了 `undefined`,还是压根没有这个 key")。
+
+结构体字段之所以被排除在外,是因为它的"存不存在"在**编译期**就已经是确定信息,不属于"运行时才知道结果"的那一类操作,自然也用不上这套"双返回值报告成败"的机制。跟[第 12 节](LEARNING-LOG.md) `strconv.Atoi` 用 `(num, err)` 暴露"转换可能失败"是同一个设计动机的不同应用:**只要一个操作在运行时有失败的可能,Go 就倾向于用多返回值把这个可能性摊开写出来,而不是靠语言偷偷兜底。**

@@ -1,6 +1,9 @@
 package errorsinterfaces
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // TODO: implement each function/method below.
 // Run `go test ./07-errors-interfaces/...` to check your work.
@@ -51,8 +54,10 @@ func FindItem(items map[int]string, id int) (string, error) {
 //	  throw new Error(`load config`, { cause: err });
 //	}
 func LoadItemConfig(items map[int]string, id int) error {
-	// TODO: call FindItem, and if it errors, return
-	// fmt.Errorf("load config: %w", err) — otherwise return nil
+	_, err := FindItem(items, id)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
 	return nil
 }
 
@@ -61,7 +66,8 @@ func LoadItemConfig(items map[int]string, id int) error {
 // assertion (which would fail once the error has been wrapped by %w).
 func IsNotFound(err error) bool {
 	// TODO: declare `var target *NotFoundError` and use errors.As(err, &target)
-	return false
+	var target *NotFoundError
+	return errors.As(err, &target)
 }
 
 // Temperature is a float64 with a custom String() method, satisfying the
@@ -77,5 +83,5 @@ type Temperature float64
 // String implements fmt.Stringer.
 func (t Temperature) String() string {
 	// TODO: return e.g. "23.5°C" — use fmt.Sprintf("%.1f°C", float64(t))
-	return ""
+	return fmt.Sprintf("%.1f°C", float64(t))
 }
