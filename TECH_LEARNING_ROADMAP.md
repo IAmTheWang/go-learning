@@ -101,6 +101,12 @@ AWS/云原生，不主动深入学习传统后端语言（尤其是Java）；英
 - **go-learning/**：对应 Phase 3 的 Go（Gin/Echo + sqlc + PostgreSQL）BFF 旗舰项目——不再是
   "优先级低于Docker/AWS SAA的可选加分项"，而是Phase 3本身的实现载体。
 
+## 延伸阅读
+
+- [`BACKEND-LANGUAGE-COMPARISON.md`](./BACKEND-LANGUAGE-COMPARISON.md)：PHP / Python /
+  Java / Go / C++ / C# 的通用横向对比，含日本市场下 Java(Spring Boot) 与 Go 的取舍
+  分析——背景参考，不改变本文件上面的优先级结论。
+
 ---
 *更新时间：2026-08-16，完整调研依据见 `~/personal/resumes/Backend_Language_Strategy_2026-08.md`、
 `LinkedIn_Job_Leads_2026-08.md`、`AU_NZ_Visa_Job_Notes_2026-08.md` 与 `STAR_Stories_EN.md`。*
